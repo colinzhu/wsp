@@ -8,6 +8,7 @@ import (
 
 	"github.com/gowsp/wsp/pkg/logger"
 	"github.com/gowsp/wsp/pkg/msg"
+	"github.com/miekg/dns"
 )
 
 var errVersion = fmt.Errorf("unsupported socks version")
@@ -32,29 +33,204 @@ func (p *Socks5Proxy) Listen() {
 			logger.Error("accept socks5 error %s", err)
 			continue
 		}
+		//logger.Info("accept socks5 %s", conn.RemoteAddr())
 		go func() {
+			defer conn.Close()
 			err := p.ServeConn(conn)
-			if err == nil || err == io.EOF {
+			if err != nil || err == io.EOF {
+				logger.Error("ServeConn error, close socks5 %s", conn.RemoteAddr(), err)
 				return
 			}
-			if err != errVersion {
-				logger.Error("serve socks5 error", err)
+		}()
+	}
+}
+
+func (p *Socks5Proxy) ListenUDP() {
+	logger.Info("listen socks5 UDP on %s", ":10812")
+	udpConn, err := net.ListenPacket("udp", ":10812")
+	if err != nil {
+		logger.Error("listen socks5 UDP error %s", err)
+		return
+	}
+	defer udpConn.Close()
+
+	for {
+		buffer := make([]byte, 4096)
+		n, udpClientAddr, err := udpConn.ReadFrom(buffer)
+		if err != nil {
+			logger.Error("accept socks5 UDP error %s", err)
+			continue
+		}
+		logger.Info("ListenUDP, udpClientAddr: %s, read first 10 bytes : %d", udpClientAddr, buffer[:10])
+
+		go func() {
+			// Parse the DNS request
+			dnsQueryObj := new(dns.Msg)
+			if err := dnsQueryObj.Unpack(buffer[10:n]); err != nil {
+				logger.Error("failed to unpack DNS request: %s", err)
+				return
 			}
+			logger.Info("Successfully unpacked DNS request: %s", dnsQueryObj.String())
+
+			// Create a TCP connection to the local SOCKS5 proxyConn
+			proxyConn, err := net.Dial("tcp", "127.0.0.1:10811")
+			if err != nil {
+				logger.Error("failed to connect to SOCKS5 proxy: %s", err)
+				return
+			}
+			defer proxyConn.Close()
+
+			// Send the DNS request over the TCP connection
+			proxyConn.Write([]byte{0x05, 0x01, 0x00})
+
+			// Read the proxy auth response from the TCP connection
+			proxyAuthResp := make([]byte, 2)
+			_, err = io.ReadFull(proxyConn, proxyAuthResp)
+			if err != nil {
+				logger.Error("failed to read proxy auth response: %s", err)
+				return
+			}
+			//logger.Info("Successfully read proxy auth response: %d", proxyAuthResp)
+
+			// Send a sock5 CONNECT request to SOCKS 5 server which connects to
+			proxyConn.Write([]byte{0x05, 0x01, 0x00, 0x01})
+			//logger.Info("original udp server and port %d", buffer[4:10])
+			proxyConn.Write(buffer[4:10]) // server and port from the original UDP request
+
+			// Read the proxy response from the TCP connection
+			proxyResp := make([]byte, 10)
+			_, err = io.ReadFull(proxyConn, proxyResp)
+			if err != nil {
+				logger.Error("failed to read proxy response: %s", err)
+				return
+			}
+			//logger.Info("Successfully read proxy response: %d", proxyResp)
+
+			// Pack the DNS query into a byte slice
+			packedQuery, err := dnsQueryObj.Pack()
+			if err != nil {
+				logger.Error("failed to pack DNS request: %s", err)
+				return
+			}
+
+			// Create a byte slice to hold the length prefix and the packed query
+			tcpDNSRqst := make([]byte, 2+len(packedQuery))
+			// Set the length prefix
+			binary.BigEndian.PutUint16(tcpDNSRqst, uint16(len(packedQuery)))
+			// Copy the packed query after the length prefix
+			copy(tcpDNSRqst[2:], packedQuery)
+
+			// dummy tcpDNSRqst
+			//tcpDNSRqst := []byte{0x00, 0x38, 0x57, 0xFD, 0x01, 0x20, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x03, 0x77, 0x77, 0x77, 0x07, 0x74, 0x65, 0x6E, 0x63, 0x65, 0x6E, 0x74, 0x03, 0x63, 0x6F, 0x6D, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x29, 0x04, 0xD0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x0A, 0x00, 0x08, 0xBF, 0x24, 0x14, 0x85, 0x56, 0x0F, 0x4C, 0x14}
+			//logger.Info("tcpDNSRqst, size: %d, %s, %d", len(tcpDNSRqst), tcpDNSRqst, tcpDNSRqst)
+
+			if _, err := proxyConn.Write(tcpDNSRqst); err != nil {
+				logger.Error("failed to send DNS request: %s", err)
+				return
+			}
+
+			// Read the DNS response from the TCP connection
+			tcpDNSResponse := make([]byte, 512)
+			n, err = io.ReadAtLeast(proxyConn, tcpDNSResponse, 1)
+			if err != nil {
+				logger.Error("failed to read TCP DNS response: %s", err)
+				return
+			}
+			tcpDNSResponse = tcpDNSResponse[2:n] // first 2 bytes are length field, trim the slice to the actual size of the response
+			//logger.Info("Successfully read TCP DNS response: %d, %s", tcpDNSResponse, string(tcpDNSResponse))
+
+			// Parse the DNS dnsResultObj
+			dnsResultObj := new(dns.Msg)
+			if err := dnsResultObj.Unpack(tcpDNSResponse); err != nil {
+				logger.Error("failed to unpack DNS response: %s", err)
+				return
+			}
+			dnsQueryObj.Truncated = true
+			logger.Info("Successfully unpacked DNS response: %s", dnsResultObj.String())
+
+			// Send the DNS response back to the UDP client
+			packedResponse, err := dnsResultObj.Pack()
+			if err != nil {
+				logger.Error("failed to pack DNS response: %s", err)
+				return
+			}
+
+			// // Create a byte slice to hold the UDP response header and the packed response
+			// udpResponse := make([]byte, 10+len(packedResponse))
+
+			// // Set the RSV field (2 bytes of zero)
+			// udpResponse[0] = 0
+			// udpResponse[1] = 0
+
+			// // Set the FRAG field (1 byte of zero)
+			// udpResponse[2] = 0
+
+			// // Set the ATYP field (1 byte, set to 1 for IPv4)
+			// udpResponse[3] = 1
+
+			// // Set the DST.ADDR and DST.PORT fields (6 bytes, set to zero)
+			// for i := 4; i < 10; i++ {
+			// 	udpResponse[i] = 0
+			// }
+
+			// // Copy the packed response after the UDP response header
+			// copy(udpResponse[10:], packedResponse)
+
+			udpRespHeader := []byte{0x00, 0x00, 0x00, 0x01, 0x08, 0x08, 0x08, 0x08, 0x00, 0x35}
+			if _, err := udpConn.WriteTo(udpRespHeader, udpClientAddr); err != nil {
+				logger.Error("failed to send UDP response header: %s", err)
+				return
+			}
+
+			if _, err := udpConn.WriteTo(packedResponse, udpClientAddr); err != nil {
+				logger.Error("failed to send DNS response: %s", err)
+				return
+			}
+
+			// // Create a DNS response with the TC flag set
+			// resp := new(dns.Msg)
+			// resp.SetReply(msg)
+			// resp.Truncated = true
+			// logger.Info("Created DNS response with TC flag set")
+
+			// // Pack the DNS response
+			// respBytes, err := resp.Pack()
+			// if err != nil {
+			// 	logger.Error("failed to pack DNS response: %s", err)
+			// 	continue
+			// }
+
+			// // Send the DNS response
+			// if _, err := conn.WriteTo(respBytes, addr); err != nil {
+			// 	logger.Error("failed to send DNS response: %s", err)
+			// }
+			// logger.Info("Successfully packed DNS response: %s", resp.String())
+
+			// go func() {
+			// 	logger.Info("Received UDP %s from %s", string(buffer[:n]), addr)
+			// 	if err != errVersion {
+			// 		logger.Error("serve socks5 error", err)
+			// 	}
+			// }()
 		}()
 	}
 }
 
 func (p *Socks5Proxy) ServeConn(conn net.Conn) error {
 	if err := p.auth(conn); err != nil {
+		logger.Error("auth socks5 error %s", err)
 		conn.Close()
 		return err
 	}
-	addr, err := p.readRequest(conn)
+	//logger.Info("auth passed, socks5 %s", conn.RemoteAddr())
+	destAddr, isUDP, err := p.getDestAddrFromRequest(conn)
 	if err != nil {
+		logger.Error("getDestAddrFromRequest faield, socks5 error %s", err)
 		conn.Close()
 		return err
 	}
-	p.replies(addr, conn)
+	logger.Info("ServeConn getDestAddrFromRequest: %s", destAddr)
+	p.replies(destAddr, isUDP, conn)
 	return nil
 }
 
@@ -85,49 +261,85 @@ func (p *Socks5Proxy) auth(conn net.Conn) error {
 	return err
 }
 
-func (p *Socks5Proxy) readRequest(conn net.Conn) (addr string, err error) {
+func (p *Socks5Proxy) getDestAddrFromRequest(conn net.Conn) (addr string, isUDP bool, err error) {
 	// +----+-----+-------+------+----------+----------+
 	// |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
 	// +----+-----+-------+------+----------+----------+
 	// | 1  |  1  | X'00' |  1   | Variable |    2     |
 	// +----+-----+-------+------+----------+----------+
 	info := make([]byte, 4)
+
 	if _, err := io.ReadFull(conn, info); err != nil {
-		return "", err
+		logger.Error("getDestAddrFromRequest, return '', error %s", err)
+		return "", false, err
 	}
+	logger.Info("getDestAddrFromRequest ReadFull, four bytes : %d", info)
 	if info[0] != 0x05 {
-		return "", errVersion
+		return "", false, errVersion
 	}
 	var host string
-	switch info[3] {
-	case 1:
-		host, err = p.readIP(conn, net.IPv4len)
-		if err != nil {
-			return "", err
+
+	switch info[1] { // Command
+	case 0x01: // CONNECT
+		if info[1] == 0x05 {
+			logger.Info("getDestAddrFromRequest, COMMAND: 5")
 		}
-	case 4:
-		host, err = p.readIP(conn, net.IPv6len)
-		if err != nil {
-			return "", err
+		switch info[3] { // Address type
+		case 1: // IPv4
+			host, err = p.readIP(conn, net.IPv4len)
+			if err != nil {
+				return "", false, err
+			}
+		case 4: // IPv6
+			host, err = p.readIP(conn, net.IPv6len)
+			if err != nil {
+				return "", false, err
+			}
+		case 3: // DOMAINNAME
+			if _, err := io.ReadFull(conn, info[3:]); err != nil {
+				return "", false, err
+			}
+			hostName := make([]byte, info[3])
+			if _, err := io.ReadFull(conn, hostName); err != nil {
+				return "", false, err
+			}
+			host = string(hostName)
+		default:
+			return "", false, fmt.Errorf("unrecognized address type")
 		}
-	case 3:
-		if _, err := io.ReadFull(conn, info[3:]); err != nil {
-			return "", err
+		//logger.Info("host: %s", host)
+
+		if _, err := io.ReadFull(conn, info[2:]); err != nil {
+			return "", false, err
 		}
-		hostName := make([]byte, info[3])
-		if _, err := io.ReadFull(conn, hostName); err != nil {
-			return "", err
+		port := binary.BigEndian.Uint16(info[2:])
+		//logger.Info("port: %d", port)
+
+		logger.Info("Command: %d, Address type: %d, Host: %s, Port: %d", info[1], info[3], host, port)
+
+		return net.JoinHostPort(host, fmt.Sprintf("%d", port)), false, nil
+
+	case 0x03: // UDP ASSOCIATE
+		// Handle UDP ASSOCIATE here
+		// For now, just return an empty address and nil error
+		//conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x7F, 0x00, 0x00, 0x01, 0x2A, 0x3C})
+		udpHostAndPort := make([]byte, 6)
+		if _, err := io.ReadFull(conn, udpHostAndPort); err != nil {
+			logger.Error("error read udpHostAndPort, return '', error %s", err)
+			return "", false, err
 		}
-		host = string(hostName)
+		//logger.Info("udpHostAndPort: %d", udpHostAndPort)
+		ip := net.IP(udpHostAndPort[:4])
+		port := binary.BigEndian.Uint16(udpHostAndPort[4:])
+
+		logger.Info("udpHostAndPort: %s:%d", ip, port)
+
+		return "", true, nil
 	default:
-		return "", fmt.Errorf("unrecognized address type")
+		return "", false, fmt.Errorf("unrecognized command: %d", info)
 	}
-	if _, err := io.ReadFull(conn, info[2:]); err != nil {
-		return "", err
-	}
-	port := binary.BigEndian.Uint16(info[2:])
-	return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil
 }
+
 func (p *Socks5Proxy) readIP(conn net.Conn, len byte) (string, error) {
 	addr := make([]byte, len)
 	if _, err := io.ReadFull(conn, addr); err != nil {
@@ -135,16 +347,35 @@ func (p *Socks5Proxy) readIP(conn net.Conn, len byte) (string, error) {
 	}
 	return net.IP(addr).String(), nil
 }
-func (p *Socks5Proxy) replies(addr string, local net.Conn) {
-	config := p.conf.DynamicAddr(addr)
-	remote, err := p.wspc.wan.DialTCP(local, config)
-	if err != nil {
-		local.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-		logger.Error("close socks5 %s %s", addr, err.Error())
+func (p *Socks5Proxy) replies(destAddr string, isUDP bool, localConn net.Conn) {
+	if isUDP {
+		logger.Info("replies: isUDP=true, %s", destAddr)
+		localConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0xC0, 0xA8, 0x1F, 0x31, 0x2A, 0x3C})
 		return
 	}
-	local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-	io.Copy(remote, local)
+	dynamicAddr := p.conf.DynamicAddr(destAddr)
+	logger.Info("dynamicAddr: %s, addr %s", dynamicAddr, destAddr)
+
+	remote, err := p.wspc.wan.DialTCP(localConn, dynamicAddr)
+	if err != nil {
+		localConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+		logger.Error("DialTCP to %s failed, %s", destAddr, err.Error())
+		return
+	}
+	logger.Info("DialTCP to %s succeeded", destAddr)
+	resp := []byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	localConn.Write(resp)
+	//logger.Info("responded to the client with %d", resp)
+
+	// dnsRqst := make([]byte, 58)
+	// if _, err := io.ReadFull(localConn, dnsRqst); err != nil {
+	// 	logger.Error("error read udpHostAndPort, return '', error %s", err)
+	// }
+	// logger.Info("dnsRqst: %d", dnsRqst)
+	// logger.Info("dnsRqst: %s", string(dnsRqst))
+
+	n, _ := io.Copy(remote, localConn)
+	logger.Info("io.Copy from localConn to remote, %d bytes", n)
 	remote.Close()
-	logger.Info("close socks5 %s, addr %s", addr, local.RemoteAddr())
+	logger.Info("remote connection closed, dest: %s, local: %s", destAddr, localConn.RemoteAddr())
 }
