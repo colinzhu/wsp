@@ -56,14 +56,14 @@ func (p *Socks5Proxy) listenUDP(tcpConn net.Conn) {
 		logger.Error("listen socks5 UDP error %s", err)
 		return
 	}
-	//defer udpConn.Close()
+	defer udpConn.Close()
 
 	// Get the chosen port number
-	localAddr := udpConn.LocalAddr().(*net.UDPAddr)
-	port := localAddr.Port
+	udpServerAddr := udpConn.LocalAddr().(*net.UDPAddr)
+	port := udpServerAddr.Port
 
 	ipAndPort := []byte{0x05, 0x00, 0x00, 0x01, 0xC0, 0xA8, 0x1F, 0x31, byte(port >> 8), byte(port)}
-	logger.Info("listen socks5 UDP on %d", ipAndPort)
+	logger.Info("%s, -> %s proxy UDP connect created: %d", tcpConn.RemoteAddr(), udpConn.LocalAddr(), ipAndPort)
 
 	// Send the port number to the client
 	_, err = tcpConn.Write(ipAndPort)
@@ -77,7 +77,7 @@ func (p *Socks5Proxy) listenUDP(tcpConn net.Conn) {
 		logger.Error("accept socks5 UDP error %s", err)
 		return
 	}
-	logger.Info("ListenUDP, udpClientAddr: %s, read first 10 bytes : %d", udpClientAddr, buffer[:10])
+	logger.Info("%s, udpClientAddr: %s, first 10 bytes from UDP request : %d", tcpConn.RemoteAddr(), udpClientAddr, buffer[:10])
 
 	// targetDNSServer, packedDNSResult, shouldReturn := getPackedDNSQueryResult(buffer, n)
 	// if shouldReturn {
@@ -91,7 +91,7 @@ func (p *Socks5Proxy) listenUDP(tcpConn net.Conn) {
 		logger.Error("failed to unpack DNS request: %s", err)
 		return
 	}
-	logger.Info("Successfully unpacked DNS request: %s", dnsQueryObj.String())
+	logger.Info("%s -> %d, unpacked DNS request: %s", tcpConn.RemoteAddr(), targetDNSServer, dnsQueryObj.String())
 
 	dnsResultObj := new(dns.Msg)
 	dnsResultObj.Truncated = true
@@ -231,7 +231,7 @@ func (p *Socks5Proxy) ServeConn(conn net.Conn) error {
 		conn.Close()
 		return err
 	}
-	logger.Info("ServeConn getDestAddrFromRequest: %s", destAddr)
+	logger.Info("%s to dest addr: %s, isUDP=%t", conn.RemoteAddr(), destAddr, isUDP)
 	p.replies(destAddr, isUDP, conn)
 	return nil
 }
@@ -275,7 +275,7 @@ func (p *Socks5Proxy) getDestAddrFromRequest(conn net.Conn) (addr string, isUDP 
 		logger.Error("getDestAddrFromRequest, return '', error %s", err)
 		return "", false, err
 	}
-	logger.Info("getDestAddrFromRequest ReadFull, four bytes : %d", info)
+	logger.Info("%s proxy request VER,CMD,RSV,ATYP: %d", conn.RemoteAddr(), info)
 	if info[0] != 0x05 {
 		return "", false, errVersion
 	}
@@ -283,9 +283,6 @@ func (p *Socks5Proxy) getDestAddrFromRequest(conn net.Conn) (addr string, isUDP 
 
 	switch info[1] { // Command
 	case 0x01: // CONNECT
-		if info[1] == 0x05 {
-			logger.Info("getDestAddrFromRequest, COMMAND: 5")
-		}
 		switch info[3] { // Address type
 		case 1: // IPv4
 			host, err = p.readIP(conn, net.IPv4len)
@@ -317,7 +314,7 @@ func (p *Socks5Proxy) getDestAddrFromRequest(conn net.Conn) (addr string, isUDP 
 		port := binary.BigEndian.Uint16(info[2:])
 		//logger.Info("port: %d", port)
 
-		logger.Info("Command: %d, Address type: %d, Host: %s, Port: %d", info[1], info[3], host, port)
+		//logger.Info("Command: %d, Address type: %d, Host: %s, Port: %d", info[1], info[3], host, port)
 
 		return net.JoinHostPort(host, fmt.Sprintf("%d", port)), false, nil
 
@@ -331,10 +328,10 @@ func (p *Socks5Proxy) getDestAddrFromRequest(conn net.Conn) (addr string, isUDP 
 			return "", false, err
 		}
 		//logger.Info("udpHostAndPort: %d", udpHostAndPort)
-		ip := net.IP(udpHostAndPort[:4])
-		port := binary.BigEndian.Uint16(udpHostAndPort[4:])
 
-		logger.Info("udpHostAndPort: %s:%d", ip, port)
+		//ip := net.IP(udpHostAndPort[:4])
+		//port := binary.BigEndian.Uint16(udpHostAndPort[4:])
+		//logger.Info("udpHostAndPort: %s:%d", ip, port)
 
 		return "", true, nil
 	default:
@@ -351,13 +348,13 @@ func (p *Socks5Proxy) readIP(conn net.Conn, len byte) (string, error) {
 }
 func (p *Socks5Proxy) replies(destAddr string, isUDP bool, localConn net.Conn) {
 	if isUDP {
-		logger.Info("replies: isUDP=true, %s", destAddr)
+		//logger.Info("%s isUDP=true", localConn.RemoteAddr())
 		//localConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0xC0, 0xA8, 0x1F, 0x31, 0x2A, 0x3C})
 		p.listenUDP(localConn)
 		return
 	}
 	dynamicAddr := p.conf.DynamicAddr(destAddr)
-	logger.Info("dynamicAddr: %s, addr %s", dynamicAddr, destAddr)
+	//logger.Info("dynamicAddr: %s, addr %s", dynamicAddr, destAddr)
 
 	remote, err := p.wspc.wan.DialTCP(localConn, dynamicAddr)
 	if err != nil {
@@ -365,20 +362,12 @@ func (p *Socks5Proxy) replies(destAddr string, isUDP bool, localConn net.Conn) {
 		logger.Error("DialTCP to %s failed, %s", destAddr, err.Error())
 		return
 	}
-	logger.Info("DialTCP to %s succeeded", destAddr)
+	logger.Info("%s -> %s DialTCP succeeded", localConn.RemoteAddr(), destAddr)
 	resp := []byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
 	localConn.Write(resp)
 	//logger.Info("responded to the client with %d", resp)
 
-	// dnsRqst := make([]byte, 58)
-	// if _, err := io.ReadFull(localConn, dnsRqst); err != nil {
-	// 	logger.Error("error read udpHostAndPort, return '', error %s", err)
-	// }
-	// logger.Info("dnsRqst: %d", dnsRqst)
-	// logger.Info("dnsRqst: %s", string(dnsRqst))
-
 	n, _ := io.Copy(remote, localConn)
-	logger.Info("io.Copy from localConn to remote, %d bytes", n)
 	remote.Close()
-	logger.Info("remote connection closed, dest: %s, local: %s", destAddr, localConn.RemoteAddr())
+	logger.Info("%s -> %s connection closed, %d bytes copied.", localConn.RemoteAddr(), destAddr, n)
 }
