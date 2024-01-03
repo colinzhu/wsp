@@ -71,7 +71,6 @@ func (p *Socks5Proxy) listenUDP(tcpConn net.Conn) {
 		logger.Error("failed to send UDP port number: %s", err)
 	}
 
-	//for {
 	buffer := make([]byte, 4096)
 	n, udpClientAddr, err := udpConn.ReadFrom(buffer)
 	if err != nil {
@@ -80,8 +79,13 @@ func (p *Socks5Proxy) listenUDP(tcpConn net.Conn) {
 	}
 	logger.Info("ListenUDP, udpClientAddr: %s, read first 10 bytes : %d", udpClientAddr, buffer[:10])
 
-	//go func() {
-	// Parse the DNS request
+	// targetDNSServer, packedDNSResult, shouldReturn := getPackedDNSQueryResult(buffer, n)
+	// if shouldReturn {
+	// 	return
+	// }
+
+	targetDNSServer := buffer[4:10]
+
 	dnsQueryObj := new(dns.Msg)
 	if err := dnsQueryObj.Unpack(buffer[10:n]); err != nil {
 		logger.Error("failed to unpack DNS request: %s", err)
@@ -89,89 +93,11 @@ func (p *Socks5Proxy) listenUDP(tcpConn net.Conn) {
 	}
 	logger.Info("Successfully unpacked DNS request: %s", dnsQueryObj.String())
 
-	// Create a TCP connection to the local SOCKS5 proxyTCPConn
-	proxyTCPConn, err := net.Dial("tcp", "127.0.0.1:10811")
-	if err != nil {
-		logger.Error("failed to connect to SOCKS5 proxy: %s", err)
-		return
-	}
-	defer proxyTCPConn.Close()
-
-	// Send the DNS request over the TCP connection
-	proxyTCPConn.Write([]byte{0x05, 0x01, 0x00})
-
-	// Read the proxy auth response from the TCP connection
-	proxyAuthResp := make([]byte, 2)
-	_, err = io.ReadFull(proxyTCPConn, proxyAuthResp)
-	if err != nil {
-		logger.Error("failed to read proxy auth response: %s", err)
-		return
-	}
-	//logger.Info("Successfully read proxy auth response: %d", proxyAuthResp)
-
-	// Send a sock5 CONNECT request to SOCKS 5 server which connects to
-	proxyTCPConn.Write([]byte{0x05, 0x01, 0x00, 0x01})
-	//logger.Info("original udp server and port %d", buffer[4:10])
-	targetDNSServer := buffer[4:10]
-	proxyTCPConn.Write(targetDNSServer) // server and port from the original UDP request
-
-	// Read the proxy response from the TCP connection
-	proxyResp := make([]byte, 10)
-	_, err = io.ReadFull(proxyTCPConn, proxyResp)
-	if err != nil {
-		logger.Error("failed to read proxy response: %s", err)
-		return
-	}
-	//logger.Info("Successfully read proxy response: %d", proxyResp)
-
-	// Pack the DNS query into a byte slice
-	packedQuery, err := dnsQueryObj.Pack()
-	if err != nil {
-		logger.Error("failed to pack DNS request: %s", err)
-		return
-	}
-
-	// Create a byte slice to hold the length prefix and the packed query
-	tcpDNSRqst := make([]byte, 2+len(packedQuery))
-	// Set the length prefix
-	binary.BigEndian.PutUint16(tcpDNSRqst, uint16(len(packedQuery)))
-	// Copy the packed query after the length prefix
-	copy(tcpDNSRqst[2:], packedQuery)
-
-	// dummy tcpDNSRqst
-	//tcpDNSRqst := []byte{0x00, 0x38, 0x57, 0xFD, 0x01, 0x20, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x03, 0x77, 0x77, 0x77, 0x07, 0x74, 0x65, 0x6E, 0x63, 0x65, 0x6E, 0x74, 0x03, 0x63, 0x6F, 0x6D, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x29, 0x04, 0xD0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x0A, 0x00, 0x08, 0xBF, 0x24, 0x14, 0x85, 0x56, 0x0F, 0x4C, 0x14}
-	//logger.Info("tcpDNSRqst, size: %d, %s, %d", len(tcpDNSRqst), tcpDNSRqst, tcpDNSRqst)
-
-	if _, err := proxyTCPConn.Write(tcpDNSRqst); err != nil {
-		logger.Error("failed to send DNS request: %s", err)
-		return
-	}
-
-	// Read the DNS response from the TCP connection
-	tcpDNSResponse := make([]byte, 512)
-	n, err = io.ReadAtLeast(proxyTCPConn, tcpDNSResponse, 1)
-	if err != nil {
-		logger.Error("failed to read TCP DNS response: %s", err)
-		return
-	}
-	tcpDNSResponse = tcpDNSResponse[2:n] // first 2 bytes are length field, trim the slice to the actual size of the response
-	//logger.Info("Successfully read TCP DNS response: %d, %s", tcpDNSResponse, string(tcpDNSResponse))
-
-	// Parse the DNS dnsResultObj
 	dnsResultObj := new(dns.Msg)
-	if err := dnsResultObj.Unpack(tcpDNSResponse); err != nil {
-		logger.Error("failed to unpack DNS response: %s", err)
-		return
-	}
-	dnsQueryObj.Truncated = true
-	logger.Info("Successfully unpacked DNS response: %s", dnsResultObj.String())
+	dnsResultObj.Truncated = true
+	dnsResultObj.SetReply(dnsQueryObj)
 
-	// Send the DNS response back to the UDP client
-	packedResponse, err := dnsResultObj.Pack()
-	if err != nil {
-		logger.Error("failed to pack DNS response: %s", err)
-		return
-	}
+	packedDNSResult, _ := dnsResultObj.Pack()
 
 	udpRespHeader := []byte{0x00, 0x00, 0x00, 0x01}
 
@@ -179,7 +105,7 @@ func (p *Socks5Proxy) listenUDP(tcpConn net.Conn) {
 	udpRespHeader = append(udpRespHeader, targetDNSServer...)
 
 	// Combine the UDP response header and the DNS response
-	combinedResponse := append(udpRespHeader, packedResponse...)
+	combinedResponse := append(udpRespHeader, packedDNSResult...)
 
 	if _, err := udpConn.WriteTo(combinedResponse, udpClientAddr); err != nil {
 		logger.Error("failed to send DNS response: %s", err)
@@ -213,6 +139,83 @@ func (p *Socks5Proxy) listenUDP(tcpConn net.Conn) {
 	// }()
 	//}()
 	//}
+}
+
+func getPackedDNSQueryResult(buffer []byte, n int) ([]byte, []byte, bool) {
+	dnsQueryObj := new(dns.Msg)
+	if err := dnsQueryObj.Unpack(buffer[10:n]); err != nil {
+		logger.Error("failed to unpack DNS request: %s", err)
+		return nil, nil, true
+	}
+	logger.Info("Successfully unpacked DNS request: %s", dnsQueryObj.String())
+
+	proxyTCPConn, err := net.Dial("tcp", "127.0.0.1:10811")
+	if err != nil {
+		logger.Error("failed to connect to SOCKS5 proxy: %s", err)
+		return nil, nil, true
+	}
+	defer proxyTCPConn.Close()
+
+	proxyTCPConn.Write([]byte{0x05, 0x01, 0x00})
+
+	proxyAuthResp := make([]byte, 2)
+	_, err = io.ReadFull(proxyTCPConn, proxyAuthResp)
+	if err != nil {
+		logger.Error("failed to read proxy auth response: %s", err)
+		return nil, nil, true
+	}
+
+	proxyTCPConn.Write([]byte{0x05, 0x01, 0x00, 0x01})
+
+	targetDNSServer := buffer[4:10]
+	proxyTCPConn.Write(targetDNSServer)
+
+	proxyResp := make([]byte, 10)
+	_, err = io.ReadFull(proxyTCPConn, proxyResp)
+	if err != nil {
+		logger.Error("failed to read proxy response: %s", err)
+		return nil, nil, true
+	}
+
+	packedQuery, err := dnsQueryObj.Pack()
+	if err != nil {
+		logger.Error("failed to pack DNS request: %s", err)
+		return nil, nil, true
+	}
+
+	tcpDNSRqst := make([]byte, 2+len(packedQuery))
+
+	binary.BigEndian.PutUint16(tcpDNSRqst, uint16(len(packedQuery)))
+
+	copy(tcpDNSRqst[2:], packedQuery)
+
+	if _, err := proxyTCPConn.Write(tcpDNSRqst); err != nil {
+		logger.Error("failed to send DNS request: %s", err)
+		return nil, nil, true
+	}
+
+	tcpDNSResponse := make([]byte, 512)
+	n, err = io.ReadAtLeast(proxyTCPConn, tcpDNSResponse, 1)
+	if err != nil {
+		logger.Error("failed to read TCP DNS response: %s", err)
+		return nil, nil, true
+	}
+	tcpDNSResponse = tcpDNSResponse[2:n]
+
+	dnsResultObj := new(dns.Msg)
+	if err := dnsResultObj.Unpack(tcpDNSResponse); err != nil {
+		logger.Error("failed to unpack DNS response: %s", err)
+		return nil, nil, true
+	}
+	dnsQueryObj.Truncated = true
+	logger.Info("Successfully unpacked DNS response: %s", dnsResultObj.String())
+
+	packedDnsResult, err := dnsResultObj.Pack()
+	if err != nil {
+		logger.Error("failed to pack DNS response: %s", err)
+		return nil, nil, true
+	}
+	return targetDNSServer, packedDnsResult, false
 }
 
 func (p *Socks5Proxy) ServeConn(conn net.Conn) error {
