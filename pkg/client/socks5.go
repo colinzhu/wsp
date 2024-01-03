@@ -45,175 +45,174 @@ func (p *Socks5Proxy) Listen() {
 	}
 }
 
-func (p *Socks5Proxy) ListenUDP() {
-	logger.Info("listen socks5 UDP on %s", ":10812")
-	udpConn, err := net.ListenPacket("udp", ":10812")
+func (p *Socks5Proxy) listenUDP(tcpConn net.Conn) {
+	// logger.Info("listen socks5 UDP on %s", ":10812")
+	//udpConn, err := net.ListenPacket("udp", ":10812")
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{
+		IP:   net.IPv4zero,
+		Port: 0, // Let the system choose a free port
+	})
 	if err != nil {
 		logger.Error("listen socks5 UDP error %s", err)
 		return
 	}
-	defer udpConn.Close()
+	//defer udpConn.Close()
 
-	for {
-		buffer := make([]byte, 4096)
-		n, udpClientAddr, err := udpConn.ReadFrom(buffer)
-		if err != nil {
-			logger.Error("accept socks5 UDP error %s", err)
-			continue
-		}
-		logger.Info("ListenUDP, udpClientAddr: %s, read first 10 bytes : %d", udpClientAddr, buffer[:10])
+	// Get the chosen port number
+	localAddr := udpConn.LocalAddr().(*net.UDPAddr)
+	port := localAddr.Port
 
-		go func() {
-			// Parse the DNS request
-			dnsQueryObj := new(dns.Msg)
-			if err := dnsQueryObj.Unpack(buffer[10:n]); err != nil {
-				logger.Error("failed to unpack DNS request: %s", err)
-				return
-			}
-			logger.Info("Successfully unpacked DNS request: %s", dnsQueryObj.String())
+	ipAndPort := []byte{0x05, 0x00, 0x00, 0x01, 0xC0, 0xA8, 0x1F, 0x31, byte(port >> 8), byte(port)}
+	logger.Info("listen socks5 UDP on %d", ipAndPort)
 
-			// Create a TCP connection to the local SOCKS5 proxyConn
-			proxyConn, err := net.Dial("tcp", "127.0.0.1:10811")
-			if err != nil {
-				logger.Error("failed to connect to SOCKS5 proxy: %s", err)
-				return
-			}
-			defer proxyConn.Close()
-
-			// Send the DNS request over the TCP connection
-			proxyConn.Write([]byte{0x05, 0x01, 0x00})
-
-			// Read the proxy auth response from the TCP connection
-			proxyAuthResp := make([]byte, 2)
-			_, err = io.ReadFull(proxyConn, proxyAuthResp)
-			if err != nil {
-				logger.Error("failed to read proxy auth response: %s", err)
-				return
-			}
-			//logger.Info("Successfully read proxy auth response: %d", proxyAuthResp)
-
-			// Send a sock5 CONNECT request to SOCKS 5 server which connects to
-			proxyConn.Write([]byte{0x05, 0x01, 0x00, 0x01})
-			//logger.Info("original udp server and port %d", buffer[4:10])
-			proxyConn.Write(buffer[4:10]) // server and port from the original UDP request
-
-			// Read the proxy response from the TCP connection
-			proxyResp := make([]byte, 10)
-			_, err = io.ReadFull(proxyConn, proxyResp)
-			if err != nil {
-				logger.Error("failed to read proxy response: %s", err)
-				return
-			}
-			//logger.Info("Successfully read proxy response: %d", proxyResp)
-
-			// Pack the DNS query into a byte slice
-			packedQuery, err := dnsQueryObj.Pack()
-			if err != nil {
-				logger.Error("failed to pack DNS request: %s", err)
-				return
-			}
-
-			// Create a byte slice to hold the length prefix and the packed query
-			tcpDNSRqst := make([]byte, 2+len(packedQuery))
-			// Set the length prefix
-			binary.BigEndian.PutUint16(tcpDNSRqst, uint16(len(packedQuery)))
-			// Copy the packed query after the length prefix
-			copy(tcpDNSRqst[2:], packedQuery)
-
-			// dummy tcpDNSRqst
-			//tcpDNSRqst := []byte{0x00, 0x38, 0x57, 0xFD, 0x01, 0x20, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x03, 0x77, 0x77, 0x77, 0x07, 0x74, 0x65, 0x6E, 0x63, 0x65, 0x6E, 0x74, 0x03, 0x63, 0x6F, 0x6D, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x29, 0x04, 0xD0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x0A, 0x00, 0x08, 0xBF, 0x24, 0x14, 0x85, 0x56, 0x0F, 0x4C, 0x14}
-			//logger.Info("tcpDNSRqst, size: %d, %s, %d", len(tcpDNSRqst), tcpDNSRqst, tcpDNSRqst)
-
-			if _, err := proxyConn.Write(tcpDNSRqst); err != nil {
-				logger.Error("failed to send DNS request: %s", err)
-				return
-			}
-
-			// Read the DNS response from the TCP connection
-			tcpDNSResponse := make([]byte, 512)
-			n, err = io.ReadAtLeast(proxyConn, tcpDNSResponse, 1)
-			if err != nil {
-				logger.Error("failed to read TCP DNS response: %s", err)
-				return
-			}
-			tcpDNSResponse = tcpDNSResponse[2:n] // first 2 bytes are length field, trim the slice to the actual size of the response
-			//logger.Info("Successfully read TCP DNS response: %d, %s", tcpDNSResponse, string(tcpDNSResponse))
-
-			// Parse the DNS dnsResultObj
-			dnsResultObj := new(dns.Msg)
-			if err := dnsResultObj.Unpack(tcpDNSResponse); err != nil {
-				logger.Error("failed to unpack DNS response: %s", err)
-				return
-			}
-			dnsQueryObj.Truncated = true
-			logger.Info("Successfully unpacked DNS response: %s", dnsResultObj.String())
-
-			// Send the DNS response back to the UDP client
-			packedResponse, err := dnsResultObj.Pack()
-			if err != nil {
-				logger.Error("failed to pack DNS response: %s", err)
-				return
-			}
-
-			// // Create a byte slice to hold the UDP response header and the packed response
-			// udpResponse := make([]byte, 10+len(packedResponse))
-
-			// // Set the RSV field (2 bytes of zero)
-			// udpResponse[0] = 0
-			// udpResponse[1] = 0
-
-			// // Set the FRAG field (1 byte of zero)
-			// udpResponse[2] = 0
-
-			// // Set the ATYP field (1 byte, set to 1 for IPv4)
-			// udpResponse[3] = 1
-
-			// // Set the DST.ADDR and DST.PORT fields (6 bytes, set to zero)
-			// for i := 4; i < 10; i++ {
-			// 	udpResponse[i] = 0
-			// }
-
-			// // Copy the packed response after the UDP response header
-			// copy(udpResponse[10:], packedResponse)
-
-			udpRespHeader := []byte{0x00, 0x00, 0x00, 0x01, 0x08, 0x08, 0x08, 0x08, 0x00, 0x35}
-			if _, err := udpConn.WriteTo(udpRespHeader, udpClientAddr); err != nil {
-				logger.Error("failed to send UDP response header: %s", err)
-				return
-			}
-
-			if _, err := udpConn.WriteTo(packedResponse, udpClientAddr); err != nil {
-				logger.Error("failed to send DNS response: %s", err)
-				return
-			}
-
-			// // Create a DNS response with the TC flag set
-			// resp := new(dns.Msg)
-			// resp.SetReply(msg)
-			// resp.Truncated = true
-			// logger.Info("Created DNS response with TC flag set")
-
-			// // Pack the DNS response
-			// respBytes, err := resp.Pack()
-			// if err != nil {
-			// 	logger.Error("failed to pack DNS response: %s", err)
-			// 	continue
-			// }
-
-			// // Send the DNS response
-			// if _, err := conn.WriteTo(respBytes, addr); err != nil {
-			// 	logger.Error("failed to send DNS response: %s", err)
-			// }
-			// logger.Info("Successfully packed DNS response: %s", resp.String())
-
-			// go func() {
-			// 	logger.Info("Received UDP %s from %s", string(buffer[:n]), addr)
-			// 	if err != errVersion {
-			// 		logger.Error("serve socks5 error", err)
-			// 	}
-			// }()
-		}()
+	// Send the port number to the client
+	_, err = tcpConn.Write(ipAndPort)
+	if err != nil {
+		logger.Error("failed to send UDP port number: %s", err)
 	}
+
+	//for {
+	buffer := make([]byte, 4096)
+	n, udpClientAddr, err := udpConn.ReadFrom(buffer)
+	if err != nil {
+		logger.Error("accept socks5 UDP error %s", err)
+		return
+	}
+	logger.Info("ListenUDP, udpClientAddr: %s, read first 10 bytes : %d", udpClientAddr, buffer[:10])
+
+	//go func() {
+	// Parse the DNS request
+	dnsQueryObj := new(dns.Msg)
+	if err := dnsQueryObj.Unpack(buffer[10:n]); err != nil {
+		logger.Error("failed to unpack DNS request: %s", err)
+		return
+	}
+	logger.Info("Successfully unpacked DNS request: %s", dnsQueryObj.String())
+
+	// Create a TCP connection to the local SOCKS5 proxyTCPConn
+	proxyTCPConn, err := net.Dial("tcp", "127.0.0.1:10811")
+	if err != nil {
+		logger.Error("failed to connect to SOCKS5 proxy: %s", err)
+		return
+	}
+	defer proxyTCPConn.Close()
+
+	// Send the DNS request over the TCP connection
+	proxyTCPConn.Write([]byte{0x05, 0x01, 0x00})
+
+	// Read the proxy auth response from the TCP connection
+	proxyAuthResp := make([]byte, 2)
+	_, err = io.ReadFull(proxyTCPConn, proxyAuthResp)
+	if err != nil {
+		logger.Error("failed to read proxy auth response: %s", err)
+		return
+	}
+	//logger.Info("Successfully read proxy auth response: %d", proxyAuthResp)
+
+	// Send a sock5 CONNECT request to SOCKS 5 server which connects to
+	proxyTCPConn.Write([]byte{0x05, 0x01, 0x00, 0x01})
+	//logger.Info("original udp server and port %d", buffer[4:10])
+	targetDNSServer := buffer[4:10]
+	proxyTCPConn.Write(targetDNSServer) // server and port from the original UDP request
+
+	// Read the proxy response from the TCP connection
+	proxyResp := make([]byte, 10)
+	_, err = io.ReadFull(proxyTCPConn, proxyResp)
+	if err != nil {
+		logger.Error("failed to read proxy response: %s", err)
+		return
+	}
+	//logger.Info("Successfully read proxy response: %d", proxyResp)
+
+	// Pack the DNS query into a byte slice
+	packedQuery, err := dnsQueryObj.Pack()
+	if err != nil {
+		logger.Error("failed to pack DNS request: %s", err)
+		return
+	}
+
+	// Create a byte slice to hold the length prefix and the packed query
+	tcpDNSRqst := make([]byte, 2+len(packedQuery))
+	// Set the length prefix
+	binary.BigEndian.PutUint16(tcpDNSRqst, uint16(len(packedQuery)))
+	// Copy the packed query after the length prefix
+	copy(tcpDNSRqst[2:], packedQuery)
+
+	// dummy tcpDNSRqst
+	//tcpDNSRqst := []byte{0x00, 0x38, 0x57, 0xFD, 0x01, 0x20, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x03, 0x77, 0x77, 0x77, 0x07, 0x74, 0x65, 0x6E, 0x63, 0x65, 0x6E, 0x74, 0x03, 0x63, 0x6F, 0x6D, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x29, 0x04, 0xD0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x00, 0x0A, 0x00, 0x08, 0xBF, 0x24, 0x14, 0x85, 0x56, 0x0F, 0x4C, 0x14}
+	//logger.Info("tcpDNSRqst, size: %d, %s, %d", len(tcpDNSRqst), tcpDNSRqst, tcpDNSRqst)
+
+	if _, err := proxyTCPConn.Write(tcpDNSRqst); err != nil {
+		logger.Error("failed to send DNS request: %s", err)
+		return
+	}
+
+	// Read the DNS response from the TCP connection
+	tcpDNSResponse := make([]byte, 512)
+	n, err = io.ReadAtLeast(proxyTCPConn, tcpDNSResponse, 1)
+	if err != nil {
+		logger.Error("failed to read TCP DNS response: %s", err)
+		return
+	}
+	tcpDNSResponse = tcpDNSResponse[2:n] // first 2 bytes are length field, trim the slice to the actual size of the response
+	//logger.Info("Successfully read TCP DNS response: %d, %s", tcpDNSResponse, string(tcpDNSResponse))
+
+	// Parse the DNS dnsResultObj
+	dnsResultObj := new(dns.Msg)
+	if err := dnsResultObj.Unpack(tcpDNSResponse); err != nil {
+		logger.Error("failed to unpack DNS response: %s", err)
+		return
+	}
+	dnsQueryObj.Truncated = true
+	logger.Info("Successfully unpacked DNS response: %s", dnsResultObj.String())
+
+	// Send the DNS response back to the UDP client
+	packedResponse, err := dnsResultObj.Pack()
+	if err != nil {
+		logger.Error("failed to pack DNS response: %s", err)
+		return
+	}
+
+	udpRespHeader := []byte{0x00, 0x00, 0x00, 0x01}
+
+	// Append targetDNSServer to udpRespHeader
+	udpRespHeader = append(udpRespHeader, targetDNSServer...)
+
+	// Combine the UDP response header and the DNS response
+	combinedResponse := append(udpRespHeader, packedResponse...)
+
+	if _, err := udpConn.WriteTo(combinedResponse, udpClientAddr); err != nil {
+		logger.Error("failed to send DNS response: %s", err)
+		return
+	}
+
+	// // Create a DNS response with the TC flag set
+	// resp := new(dns.Msg)
+	// resp.SetReply(msg)
+	// resp.Truncated = true
+	// logger.Info("Created DNS response with TC flag set")
+
+	// // Pack the DNS response
+	// respBytes, err := resp.Pack()
+	// if err != nil {
+	// 	logger.Error("failed to pack DNS response: %s", err)
+	// 	continue
+	// }
+
+	// // Send the DNS response
+	// if _, err := conn.WriteTo(respBytes, addr); err != nil {
+	// 	logger.Error("failed to send DNS response: %s", err)
+	// }
+	// logger.Info("Successfully packed DNS response: %s", resp.String())
+
+	// go func() {
+	// 	logger.Info("Received UDP %s from %s", string(buffer[:n]), addr)
+	// 	if err != errVersion {
+	// 		logger.Error("serve socks5 error", err)
+	// 	}
+	// }()
+	//}()
+	//}
 }
 
 func (p *Socks5Proxy) ServeConn(conn net.Conn) error {
@@ -350,7 +349,8 @@ func (p *Socks5Proxy) readIP(conn net.Conn, len byte) (string, error) {
 func (p *Socks5Proxy) replies(destAddr string, isUDP bool, localConn net.Conn) {
 	if isUDP {
 		logger.Info("replies: isUDP=true, %s", destAddr)
-		localConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0xC0, 0xA8, 0x1F, 0x31, 0x2A, 0x3C})
+		//localConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0xC0, 0xA8, 0x1F, 0x31, 0x2A, 0x3C})
+		p.listenUDP(localConn)
 		return
 	}
 	dynamicAddr := p.conf.DynamicAddr(destAddr)
